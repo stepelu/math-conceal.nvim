@@ -17,6 +17,7 @@ local buffer_cache = {}
 local parser_callbacks = setmetatable({}, { __mode = "k" })
 -- Viewport caching: store computed node lists per window
 local win_states = {}
+local win_cursors = {}
 local range_cache_limit = 64
 local viewport_margin = 30
 
@@ -135,6 +136,7 @@ vim.api.nvim_create_autocmd("WinClosed", {
     local win_id = tonumber(args.match)
     if win_id then
       win_states[win_id] = nil
+      win_cursors[win_id] = nil
     end
   end,
 })
@@ -605,6 +607,10 @@ local function setup_decoration_provider()
       local set_extmark = vim.api.nvim_buf_set_extmark
       sync_line_conceal_marks(buf_id, state, curr_row, curr_col, toprow, botrow)
       local keep_conceal = keep_conceal_under_cursor(buf_id)
+      -- on_win can precede CursorMoved; leave the previous reveal ranges intact.
+      if not win_cursors[win_id] or win_cursors[win_id].buf ~= buf_id then
+        win_cursors[win_id] = { buf = buf_id, row = curr_row, col = curr_col, keep = keep_conceal }
+      end
 
       for _, m in ipairs(state.marks) do
         if m[12] == "line" or not mark_overlaps_range(m, toprow, botrow) then
@@ -650,6 +656,64 @@ local function redraw_current_window_for_buf(buf)
   local top = info.topline - 1
   local bot = info.botline
   redraw_win(win, { top, bot })
+end
+
+local function redraw_cursor_changes(buf)
+  local win = vim.api.nvim_get_current_win()
+  if not valid_buf_window(buf, win) then
+    return
+  end
+
+  local cursor = vim.api.nvim_win_get_cursor(win)
+  local current = { buf = buf, row = cursor[1] - 1, col = cursor[2], keep = keep_conceal_under_cursor(buf) }
+  local previous = win_cursors[win]
+  win_cursors[win] = current
+  local state = win_states[win]
+  local cache = buffer_cache[buf]
+  if
+    not previous
+    or previous.buf ~= buf
+    or not state
+    or state.buf ~= buf
+    or state.cache ~= cache
+    or state.tick ~= vim.b[buf].changedtick
+    or state.version ~= cache.version
+  then
+    -- Edits or reattachment can invalidate the previous source positions.
+    redraw_current_window_for_buf(buf)
+    return
+  end
+
+  local ranges = {}
+  for _, mark in ipairs(state.marks) do
+    local before = not previous.keep
+      and position_inside_range(previous.row, previous.col, mark[8], mark[9], mark[10], mark[11])
+    local after = not current.keep
+      and position_inside_range(current.row, current.col, mark[8], mark[9], mark[10], mark[11])
+    if before ~= after then
+      -- Redraw whole source lines (end-exclusive), including wrapped portions.
+      local last = math.max(mark[1] + 1, mark[3] + (mark[4] > 0 and 1 or 0))
+      ranges[#ranges + 1] = { mark[1], last }
+    end
+  end
+
+  table.sort(ranges, function(a, b)
+    return a[1] < b[1]
+  end)
+  local pending
+  for _, range in ipairs(ranges) do
+    if pending and range[1] <= pending[2] then
+      pending[2] = math.max(pending[2], range[2])
+    else
+      if pending then
+        redraw_win(win, pending)
+      end
+      pending = range
+    end
+  end
+  if pending then
+    redraw_win(win, pending)
+  end
 end
 
 ---Attach conceal logic to buffer
@@ -728,7 +792,7 @@ local function attach_to_buffer(buf, config)
     group = augroup,
     buffer = buf,
     callback = function()
-      redraw_current_window_for_buf(buf)
+      redraw_cursor_changes(buf)
     end,
   })
 
@@ -737,7 +801,7 @@ local function attach_to_buffer(buf, config)
     buffer = buf,
     callback = function(args)
       if mode_changed_involves_visual(args.match) then
-        redraw_current_window_for_buf(buf)
+        redraw_cursor_changes(buf)
       end
     end,
   })
@@ -830,6 +894,11 @@ function M.detach(buf)
   for win_id, state in pairs(win_states) do
     if state.buf == buf then
       win_states[win_id] = nil
+    end
+  end
+  for win_id, cursor in pairs(win_cursors) do
+    if cursor.buf == buf then
+      win_cursors[win_id] = nil
     end
   end
 end

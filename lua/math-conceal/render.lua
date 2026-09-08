@@ -458,6 +458,7 @@ local function marks_cover_range(state, buf_id, cache, tick, version, toprow, bo
     and state.top <= toprow
     and state.bot >= botrow
     and type(state.marks) == "table"
+    and cache.parser:is_valid()
 end
 
 local function range_cache_key(tick, version, toprow, botrow)
@@ -541,7 +542,7 @@ local function collect_cached_marks(buf_id, cache, toprow, botrow, opts)
 
   local key = range_cache_key(tick, version, toprow, botrow)
   cache.range_cache = cache.range_cache or {}
-  if cache.range_cache[key] ~= nil then
+  if cache.range_cache[key] ~= nil and cache.parser:is_valid() then
     return cache.range_cache[key]
   end
 
@@ -723,6 +724,7 @@ local function redraw_cursor_changes(buf)
     or state.cache ~= cache
     or state.tick ~= vim.b[buf].changedtick
     or state.version ~= cache.version
+    or not cache.parser:is_valid()
   then
     -- Edits or reattachment can invalidate the previous source positions.
     redraw_current_window_for_buf(buf)
@@ -776,25 +778,6 @@ local function attach_to_buffer(buf, config)
     return false
   end
 
-  if buffer_cache[buf] then
-    buffer_cache[buf].parser = parser
-    buffer_cache[buf].root_lang = root_lang
-    buffer_cache[buf].specs = specs
-    buffer_cache[buf].version = buffer_cache[buf].version + 1
-    buffer_cache[buf].range_cache = {}
-    buffer_cache[buf].range_cache_order = {}
-    return true
-  end
-
-  buffer_cache[buf] = {
-    parser = parser,
-    root_lang = root_lang,
-    specs = specs,
-    version = 1,
-    range_cache = {},
-    range_cache_order = {},
-  }
-
   if parser_callbacks[parser] ~= true then
     parser_callbacks[parser] = true
     parser:register_cbs({
@@ -830,6 +813,25 @@ local function attach_to_buffer(buf, config)
       end,
     }, true)
   end
+
+  if buffer_cache[buf] then
+    buffer_cache[buf].parser = parser
+    buffer_cache[buf].root_lang = root_lang
+    buffer_cache[buf].specs = specs
+    buffer_cache[buf].version = buffer_cache[buf].version + 1
+    buffer_cache[buf].range_cache = {}
+    buffer_cache[buf].range_cache_order = {}
+    return true
+  end
+
+  buffer_cache[buf] = {
+    parser = parser,
+    root_lang = root_lang,
+    specs = specs,
+    version = 1,
+    range_cache = {},
+    range_cache_order = {},
+  }
 
   ensure_buffer_cleanup_autocmds(buf)
 
@@ -983,7 +985,16 @@ end
 ---@param opts table?
 ---@return table config
 function M.set_default_buffer_config(opts)
+  local previous = default_buffer_config
   default_buffer_config = normalize_buffer_config(opts, default_buffer_config)
+  if previous.mode ~= default_buffer_config.mode then
+    for win, cursor in pairs(win_cursors) do
+      if not buffer_configs[cursor.buf] and valid_buf_window(cursor.buf, win) then
+        win_cursors[win] = nil
+        redraw_win(win)
+      end
+    end
+  end
   return vim.deepcopy(default_buffer_config)
 end
 
@@ -1017,6 +1028,7 @@ function M.setup_buffer(buf, opts)
   ensure_buffer_cleanup_autocmds(buf)
   window_options.attach(buf, "render")
   for _, win in ipairs(buf_wins(buf)) do
+    win_cursors[win] = nil
     redraw_win(win)
   end
 

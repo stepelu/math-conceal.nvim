@@ -249,7 +249,29 @@ local function run()
   assert_true("new parser region is concealed", has_symbol(reparsed, 141, "α"))
   assert_true("old cached parser region is discarded", not has_symbol(reparsed, 140, "α"))
   assert_matches_fresh("refill never merges different parser generations", win, generation_buf, 111, 141)
+  for _, opts in ipairs({ { winid = win, toprow = 141, botrow = 150 }, { toprow = 141, botrow = 150 } }) do
+    parser:set_included_regions({ { { 141, 0, 172, 0 } } })
+    assert_true("parser region populates cache", #render.collect_display_marks(generation_buf, opts) > 0)
+    parser:set_included_regions({ { { 200, 0, 231, 0 } } })
+    assert_true("pending parser changes invalidate the tree", not parser:is_valid())
+    assert_eq("cache hits reparse pending regions", render.collect_display_marks(generation_buf, opts), {})
+  end
   generation_handle:detach()
+
+  local parser_buf, parser_handle = attach("latex", vim.fn["repeat"]({ "$ alpha + x^2 $" }, 320))
+  assert_true("replacement parser attaches", render.attach(parser_buf, "typst"))
+  vim.api.nvim_win_set_buf(win, parser_buf)
+  vim.api.nvim_win_set_cursor(win, { 1, 0 })
+  assert_true("replacement parser renders", has_symbol(draw(win, parser_buf, 100, 110), 100, "𝛼"))
+  local range = { toprow = 100, botrow = 110 }
+  assert_true("replacement parser populates range cache", #render.collect_display_marks(parser_buf, range) > 0)
+  local replacement_parser = vim.treesitter.get_parser(parser_buf, "typst")
+  replacement_parser:set_included_regions({ { { 141, 0, 172, 0 } } })
+  replacement_parser:parse(true)
+  assert_true("replacement parser finishes parsing", replacement_parser:is_valid())
+  assert_eq("replacement parser invalidates viewport cache", draw(win, parser_buf, 100, 110), {})
+  assert_eq("replacement parser invalidates range cache", render.collect_display_marks(parser_buf, range), {})
+  parser_handle:detach()
 
   local multiline = {}
   for row = 0, 119 do

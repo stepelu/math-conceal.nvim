@@ -139,6 +139,16 @@ local function run()
   draw()
   assert_eq("preview retains symbol under cursor", #emitted, 3)
 
+  move(4, 2)
+  render.setup_buffer(buf, { mode = "edit" })
+  draw()
+  assert_eq("preview to edit expands multiline equation", #emitted, 2)
+  move(6, 0, true)
+  assert_eq("motion after mode redraw conceals the complete equation", ranges(), { { 2, 5 } })
+  render.setup_buffer(buf, { mode = "preview" })
+  move(2, 1)
+  draw()
+
   render.setup_buffer(buf, { mode = "presentation" })
   local get_mode = vim.api.nvim_get_mode
   local mode = "n"
@@ -178,6 +188,37 @@ local function run()
   assert_eq("refreshed edit cache restores no-op motion", ranges(), {})
   move(1, 0)
   assert_eq("refreshed edit cache restores targeted redraw", ranges(), { { 2, 3 } })
+
+  vim.api.nvim_buf_set_lines(replacement, 0, -1, false, { "outside", "\\[", "a + b", "\\]", "outside" })
+  vim.api.nvim_win_set_cursor(win, { 3, 1 })
+  draw()
+  event()
+  vim.api.nvim_set_current_win(split)
+  draw()
+  event()
+  vim.api.nvim_set_current_win(win)
+
+  redraws = {}
+  render.set_default_buffer_config({ mode = "preview" })
+  assert_eq(
+    "default change redraws only inheriting windows",
+    vim.tbl_map(function(opts)
+      return opts.win
+    end, redraws),
+    { win }
+  )
+  draw()
+  assert_eq("default preview conceals equation under cursor", #emitted, 1)
+  move(3, 2)
+  render.set_default_buffer_config({ mode = "edit" })
+  draw()
+  assert_eq("default edit expands equation under cursor", #emitted, 0)
+  move(5, 0, true)
+  assert_eq("motion after default mode redraw conceals equation", ranges(), { { 1, 4 } })
+  assert_eq("explicit mode survives default changes", render.get_buffer_config(buf).mode, "presentation")
+  vim.api.nvim_set_current_win(split)
+  move(1, 0)
+  assert_eq("default changes preserve explicit mode cursor state", ranges(), {})
 
   render.detach(buf)
   render.detach(replacement)

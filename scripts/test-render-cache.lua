@@ -40,6 +40,7 @@ local function run()
     return set_extmark(buf, ns, row, col, opts)
   end
   local passes = 0
+  local query_ranges = {}
   local parsed = {}
   local parse = vim.treesitter.query.parse
   vim.treesitter.query.parse = function(...)
@@ -49,6 +50,8 @@ local function run()
       local iter_captures = query.iter_captures
       query.iter_captures = function(...)
         passes = passes + 1
+        local first, last = select(4, ...)
+        query_ranges[#query_ranges + 1] = { first, last }
         return iter_captures(...)
       end
     end
@@ -81,6 +84,12 @@ local function run()
       end
     end
     return false
+  end
+  local function assert_matches_fresh(label, target, owner, top, bot)
+    local cached = render.collect_display_marks(owner, { winid = target, toprow = top, botrow = bot })
+    local fresh = render.collect_display_marks(owner, { toprow = top, botrow = bot })
+    assert_eq(label, cached, fresh)
+    return cached
   end
 
   local source = { "Plain text without math." }
@@ -138,6 +147,20 @@ local function run()
   assert_eq("row collection agrees with flat collection", by_row[105], public)
   assert_eq("public collection can reuse the window cache", passes, cached_passes)
 
+  -- Query only uncovered source rows. Compare complete ordered marks against
+  -- an independent exact-range collection after each refill.
+  for _, case in ipairs({
+    { name = "downward refill", top = 111, bot = 141, queries = { { 141, 172 } } },
+    { name = "upward refill", top = 69, bot = 99, queries = { { 39, 81 } } },
+    { name = "both-side growth", top = 30, bot = 140, queries = { { 0, 39 }, { 130, 171 } } },
+    { name = "disjoint jump", top = 250, bot = 260, queries = { { 220, 291 } } },
+  }) do
+    query_ranges = {}
+    draw(win, buf, case.top, case.bot)
+    assert_eq(case.name .. " queries only missing rows", query_ranges, case.queries)
+    assert_matches_fresh(case.name .. " preserves ordered marks", win, buf, case.top, case.bot)
+  end
+
   vim.api.nvim_set_current_win(win)
   vim.bo[buf].undolevels = -1
   vim.api.nvim_buf_set_lines(buf, 105, 106, false, { "$\\alpha$" })
@@ -187,6 +210,12 @@ local function run()
     cached_passes = passes
     assert_true(case.kind .. " retains offscreen symbols", has_symbol(draw(win, other_buf, 41, 51), 51, case.symbol))
     assert_eq(case.kind .. " reuses viewport padding", passes, cached_passes)
+    for _, viewport in ipairs({ { 60, 90 }, { 0, 30 } }) do
+      cached_passes = passes
+      draw(win, other_buf, viewport[1], viewport[2])
+      assert_true(case.kind .. " refills newly exposed rows", passes > cached_passes)
+      assert_matches_fresh(case.kind .. " refill preserves ordered marks", win, other_buf, viewport[1], viewport[2])
+    end
     other_handle:detach()
   end
 
@@ -199,6 +228,28 @@ local function run()
     has_symbol(render.collect_display_marks(last_buf, { toprow = 1, botrow = 1 }), 1, "α")
   )
   last_handle:detach()
+
+  local generation_buf, generation_handle = attach("latex", source)
+  vim.api.nvim_win_set_buf(win, generation_buf)
+  vim.api.nvim_win_set_cursor(win, { 1, 0 })
+  draw(win, generation_buf, 100, 110)
+  local parser = vim.treesitter.get_parser(generation_buf, "latex")
+  local changes = 0
+  parser:register_cbs({
+    on_changedtree = function()
+      changes = changes + 1
+    end,
+  })
+  local tick = vim.b[generation_buf].changedtick
+  parser:set_included_regions({ { { 141, 0, 172, 0 } } })
+  assert_eq("region change waits for parsing", changes, 0)
+  local reparsed = draw(win, generation_buf, 111, 141)
+  assert_true("refill parsing changes tree generation", changes > 0)
+  assert_eq("parser generation changes without editing text", vim.b[generation_buf].changedtick, tick)
+  assert_true("new parser region is concealed", has_symbol(reparsed, 141, "α"))
+  assert_true("old cached parser region is discarded", not has_symbol(reparsed, 140, "α"))
+  assert_matches_fresh("refill never merges different parser generations", win, generation_buf, 111, 141)
+  generation_handle:detach()
 
   local multiline = {}
   for row = 0, 119 do
@@ -222,7 +273,44 @@ local function run()
     has_symbol(draw(win, multiline_buf, 60, 70), 9, "…")
   )
   assert_eq("multiline cache hit avoids querying", passes, cached_passes)
+
+  render.update_query(
+    "latex",
+    [[
+    ((curly_group) @first (#set! @first conceal "A") (#set! @first priority 90))
+    ((curly_group) @second (#set! @second conceal "B") (#set! @second priority 110))
+  ]]
+  )
+  assert_true("distinct captures on one node attach", render.attach(multiline_buf, "latex"))
+  draw(win, multiline_buf, 40, 50)
+  local distinct = assert_matches_fresh("initial distinct captures retain order", win, multiline_buf, 40, 50)
+  assert_eq("same node retains both capture priorities", { distinct[1].priority, distinct[2].priority }, { 90, 110 })
+  for _, viewport in ipairs({ { 60, 90 }, { 0, 30 } }) do
+    draw(win, multiline_buf, viewport[1], viewport[2])
+    assert_matches_fresh(
+      "multiline refill seam preserves distinct captures without duplicates",
+      win,
+      multiline_buf,
+      viewport[1],
+      viewport[2]
+    )
+  end
   multiline_handle:detach()
+
+  local dense_buf, dense_handle = attach("latex", vim.fn["repeat"]({ "a" }, 40))
+  render.update_query(
+    "latex",
+    [[
+    ((text (word) @a (word) @b) (#set! @a conceal "X") (#set! @b conceal "Y"))
+  ]]
+  )
+  assert_true("dense capture query attaches", render.attach(dense_buf, "latex"))
+  vim.api.nvim_win_set_buf(win, dense_buf)
+  vim.api.nvim_win_set_cursor(win, { 1, 0 })
+  draw(win, dense_buf, 0, 39)
+  local dense = assert_matches_fresh("dense captures do not depend on queried range", win, dense_buf, 30, 30)
+  assert_eq("dense query retains every capture on the requested row", #dense, 39)
+  dense_handle:detach()
 
   print("render-cache-ok")
 end

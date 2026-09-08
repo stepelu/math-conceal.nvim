@@ -381,11 +381,14 @@ end
 
 local function collect_marks(buf_id, cache, toprow, botrow)
   local marks = {}
+  local group = 0
   for _, spec in ipairs(cache.specs) do
     local trees = get_query_trees(cache, spec)
     for _, tree in ipairs(trees) do
+      group = group + 1
       local root = tree:root()
-      for id, node, metadata in spec.query:iter_captures(root, buf_id, toprow, botrow + 1) do
+      -- The default match limit can truncate dense queries differently across ranges.
+      for id, node, metadata in spec.query:iter_captures(root, buf_id, toprow, botrow + 1, { match_limit = 4096 }) do
         local capture_data = metadata[id]
         local conceal_char = capture_data and capture_data.conceal or metadata.conceal
         local conceal_lines = capture_data and capture_data.conceal_lines or metadata.conceal_lines
@@ -409,6 +412,7 @@ local function collect_marks(buf_id, cache, toprow, botrow)
               r1, -- [10]
               #line, -- [11]
               "line", -- [12]
+              group, -- [13] query/tree order
             })
           end
         elseif conceal_char then
@@ -435,6 +439,7 @@ local function collect_marks(buf_id, cache, toprow, botrow)
               ec1, -- [9]
               er2, -- [10]
               ec2, -- [11]
+              [13] = group, -- query/tree order
             })
           end
         end
@@ -474,6 +479,36 @@ local function cache_range_marks(cache, key, marks)
   end
 end
 
+local function extend_cached_marks(buf_id, cache, state, top, bot)
+  local groups = {}
+  local group_count = 0
+  local function append(marks, first, last)
+    for _, mark in ipairs(marks) do
+      if mark[1] >= first and mark[1] <= last and mark[1] <= bot and mark[3] >= top then
+        local group = mark[13]
+        groups[group] = groups[group] or {}
+        table.insert(groups[group], mark)
+        group_count = math.max(group_count, group)
+      end
+    end
+  end
+
+  -- Assign captures by their start row, preserving order at refill boundaries.
+  if top < state.top then
+    append(collect_marks(buf_id, cache, top, state.top - 1), 0, state.top - 1)
+  end
+  append(state.marks, top < state.top and state.top or 0, state.bot)
+  if bot > state.bot then
+    append(collect_marks(buf_id, cache, state.bot + 1, bot), state.bot + 1, bot)
+  end
+
+  local marks = {}
+  for group = 1, group_count do
+    vim.list_extend(marks, groups[group] or {})
+  end
+  return marks
+end
+
 local function collect_cached_marks(buf_id, cache, toprow, botrow, opts)
   local tick = vim.b[buf_id].changedtick
   local version = cache.version
@@ -487,7 +522,17 @@ local function collect_cached_marks(buf_id, cache, toprow, botrow, opts)
     if not marks_cover_range(state, buf_id, cache, tick, version, toprow, botrow) then
       local top = math.max(0, toprow - viewport_margin)
       local bot = math.min(last_row, botrow + viewport_margin)
-      local marks = collect_marks(buf_id, cache, top, bot)
+      local overlap_top = state and math.max(top, state.top) or top
+      local overlap_bot = state and math.min(bot, state.bot) or bot
+      local marks
+      if
+        overlap_top <= overlap_bot and marks_cover_range(state, buf_id, cache, tick, version, overlap_top, overlap_bot)
+      then
+        marks = extend_cached_marks(buf_id, cache, state, top, bot)
+      end
+      if not marks or cache.version ~= version then
+        marks = collect_marks(buf_id, cache, top, bot)
+      end
       state = { buf = buf_id, cache = cache, tick = tick, version = cache.version, top = top, bot = bot, marks = marks }
       win_states[win_id] = state
     end
